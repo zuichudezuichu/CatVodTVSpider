@@ -1,26 +1,163 @@
-name: Android CI
-
-on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+name: android_build_test
+on: [workflow_dispatch]
 
 jobs:
-  build:
-
+  build-test-apk:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 40
+    env:
+      ANDROID_SDK_ROOT: /home/runner/android-sdk
+      TEST_SUFFIX: "-TEST-$(date +%Y%m%d%H%M)"
     steps:
-    - uses: actions/checkout@v4
-    - name: set up JDK 11
-      uses: actions/setup-java@v4
-      with:
-        java-version: '11'
-        distribution: 'temurin'
-        cache: gradle
+      # 1. 拉取代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-    - name: Build with Gradle
-      run: ./gradlew build
+      # 2. 校验并修复仓库地址
+      - name: Validate and fix project URL
+        run: |
+          if [ ! -f "project-to-build" ]; then
+            echo "❌ project-to-build file not found!"
+            exit 1
+          fi
+          RAW_URL=$(cat project-to-build | tr -d '\r\n \t' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          echo "🔍 Raw URL from file: $RAW_URL"
+          
+          if [ -z "$RAW_URL" ]; then
+            echo "❌ project-to-build file is empty!"
+            exit 1
+          fi
+          
+          # 自动补全.git后缀
+          if [[ "$RAW_URL" =~ ^https://.* && ! "$RAW_URL" =~ \.git$ ]]; then
+            PROJECT_URL="${RAW_URL}.git"
+          elif [[ "$RAW_URL" =~ ^git@.*:.* && ! "$RAW_URL" =~ \.git$ ]]; then
+            PROJECT_URL="${RAW_URL}.git"
+          else
+            PROJECT_URL="$RAW_URL"
+          fi
+          echo "✅ Fixed URL: $PROJECT_URL"
+          
+          echo "PROJECT_URL=$PROJECT_URL" >> $GITHUB_ENV
+          echo "RAW_URL=$RAW_URL" >> $GITHUB_ENV
+
+      # 3. 安装系统依赖
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip zip wget openjdk-11-jdk lib32stdc++6 lib32z1 git
+          git --version && java -version
+
+      # 4. 配置Git（核心修复：适配私有仓库+网络加速）
+      - name: Configure Git for private repos/network
+        run: |
+          # 配置GitHub令牌（若仓库私有，需先在Settings->Secrets添加GITHUB_PAT）
+          if [ -n "${{ secrets.GITHUB_PAT }}" ]; then
+            git config --global url."https://${{ secrets.GITHUB_PAT }}:@github.com/".insteadOf "https://github.com/"
+            echo "✅ Configured Git with PAT for private repos"
+          fi
+          
+          # 配置超时+缓存+网络加速
+          git config --global http.timeout 300
+          git config --global credential.helper 'cache --timeout=300'
+          # 国内网络优化（可选）
+          git config --global url."https://ghproxy.com/https://github.com/".insteadOf "https://github.com/"
+
+      # 5. 原生安装Android SDK
+      - name: Install Android SDK
+        run: |
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          cd $ANDROID_SDK_ROOT/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O sdk.zip
+          unzip -q sdk.zip
+          mv cmdline-tools latest
+          
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platforms;android-33" "build-tools;33.0.2" "platform-tools"
+
+      # 6. 克隆项目（增加重试+详细错误输出）
+      - name: Clone project (with retry)
+        run: |
+          rm -rf project
+          CLONE_SUCCESS=0
+          
+          # 尝试1：修复后的带.git地址（3次重试）
+          for i in {1..3}; do
+            echo "🔹 Attempt $i: Clone ${{ env.PROJECT_URL }}"
+            if git clone --depth=1 --timeout=300 ${{ env.PROJECT_URL }} project; then
+              CLONE_SUCCESS=1
+              break
+            fi
+            echo "⚠️ Attempt $i failed, waiting 5s..."
+            sleep 5
+          done
+          
+          # 尝试2：原始地址（3次重试）
+          if [ $CLONE_SUCCESS -eq 0 ]; then
+            for i in {1..3}; do
+              echo "🔹 Attempt $i: Clone ${{ env.RAW_URL }}"
+              if git clone --depth=1 --timeout=300 ${{ env.RAW_URL }} project; then
+                CLONE_SUCCESS=1
+                break
+              fi
+              echo "⚠️ Attempt $i failed, waiting 5s..."
+              sleep 5
+            done
+          fi
+          
+          # 最终校验
+          if [ $CLONE_SUCCESS -eq 0 ]; then
+            echo "❌ Failed to clone project with both URLs!"
+            echo "📝 Debug info:"
+            echo "   Fixed URL: ${{ env.PROJECT_URL }}"
+            echo "   Raw URL: ${{ env.RAW_URL }}"
+            echo "   Git version: $(git --version)"
+            exit 1
+          fi
+          
+          chmod -R 755 project
+          echo "✅ Clone succeeded! Project files:"
+          ls -la project/
+
+      # 7. 配置Gradle镜像
+      - name: Gradle mirror
+        run: |
+          mkdir -p ~/.gradle
+          echo "allprojects{repositories{maven{url 'https://maven.aliyun.com/repository/public'}google()mavenCentral()}}" > ~/.gradle/init.gradle
+
+      # 8. 构建测试版APK
+      - name: Build TEST APK
+        working-directory: ./project
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "⚠️ Generating gradlew..."
+            gradle wrapper --gradle-version 7.6
+          fi
+          chmod +x gradlew
+          
+          export ANDROID_HOME=$ANDROID_SDK_ROOT
+          export PATH=$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/build-tools/33.0.2:$PATH
+          
+          ./gradlew clean assembleDebug -PtestBuild=true --no-daemon --stacktrace -Xmx3072m
+          
+          APK_FILE=$(find . -name "*.apk" -path "*/build/outputs/apk/debug/*.apk" | grep -v unaligned | head -1)
+          if [ -z "$APK_FILE" ]; then
+            echo "❌ No TEST APK generated!"
+            exit 1
+          fi
+          
+          mkdir -p output
+          mv "$APK_FILE" "output/test-apk${{ env.TEST_SUFFIX }}.apk"
+          echo "✅ Built TEST APK: $(ls output/*.apk)"
+
+      # 9. 上传测试版APK
+      - name: Upload TEST APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-apk
+          path: ./project/output/*.apk
+          retention-days: 3
+          if-no-files-found: warn
