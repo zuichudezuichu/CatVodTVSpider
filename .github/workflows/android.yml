@@ -8,40 +8,49 @@ jobs:
     env:
       ANDROID_SDK_ROOT: /home/runner/android-sdk
       TEST_SUFFIX: "-TEST-$(date +%Y%m%d%H%M)"
+      # 兜底：直接配置仓库地址（避免文件缺失）
+      DEFAULT_PROJECT_URL: "https://github.com/zuichudezuichu/Box"
     steps:
-      # 1. 拉取代码
-      - name: Checkout code
+      # 1. 拉取代码（确保包含根目录文件）
+      - name: Checkout code (full repo)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 1  # 拉取完整仓库（包含根目录文件）
 
-      # 2. 校验并修复仓库地址
-      - name: Validate and fix project URL
+      # 2. 校验并获取仓库地址（核心修复：文件缺失时用兜底地址）
+      - name: Get project URL (with fallback)
         run: |
-          if [ ! -f "project-to-build" ]; then
-            echo "❌ project-to-build file not found!"
-            exit 1
-          fi
-          RAW_URL=$(cat project-to-build | tr -d '\r\n \t' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-          echo "🔍 Raw URL from file: $RAW_URL"
-          
-          if [ -z "$RAW_URL" ]; then
-            echo "❌ project-to-build file is empty!"
-            exit 1
-          fi
-          
-          # 自动补全.git后缀
-          if [[ "$RAW_URL" =~ ^https://.* && ! "$RAW_URL" =~ \.git$ ]]; then
-            PROJECT_URL="${RAW_URL}.git"
-          elif [[ "$RAW_URL" =~ ^git@.*:.* && ! "$RAW_URL" =~ \.git$ ]]; then
-            PROJECT_URL="${RAW_URL}.git"
+          # 步骤1：检查根目录是否有project-to-build文件
+          if [ -f "project-to-build" ]; then
+            # 读取文件中的地址
+            RAW_URL=$(cat project-to-build | tr -d '\r\n \t' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            echo "✅ Found project-to-build file, URL: $RAW_URL"
+            # 空值校验：若文件为空则用兜底地址
+            if [ -z "$RAW_URL" ]; then
+              echo "⚠️ project-to-build file is empty, using default URL"
+              PROJECT_URL="${{ env.DEFAULT_PROJECT_URL }}"
+            else
+              # 自动补全.git后缀
+              if [[ "$RAW_URL" =~ ^https://.* && ! "$RAW_URL" =~ \.git$ ]]; then
+                PROJECT_URL="${RAW_URL}.git"
+              else
+                PROJECT_URL="$RAW_URL"
+              fi
+            fi
           else
-            PROJECT_URL="$RAW_URL"
+            # 步骤2：文件不存在时，直接使用兜底地址
+            echo "⚠️ project-to-build file not found, using default URL"
+            PROJECT_URL="${{ env.DEFAULT_PROJECT_URL }}"
           fi
-          echo "✅ Fixed URL: $PROJECT_URL"
           
+          # 最终校验地址格式
+          if [[ ! "$PROJECT_URL" =~ ^(https?://|git@) ]]; then
+            echo "❌ Invalid project URL: $PROJECT_URL"
+            exit 1
+          fi
+          
+          echo "✅ Final project URL: $PROJECT_URL"
           echo "PROJECT_URL=$PROJECT_URL" >> $GITHUB_ENV
-          echo "RAW_URL=$RAW_URL" >> $GITHUB_ENV
 
       # 3. 安装系统依赖
       - name: Install dependencies
@@ -50,20 +59,16 @@ jobs:
           sudo apt-get install -y unzip zip wget openjdk-11-jdk lib32stdc++6 lib32z1 git
           git --version && java -version
 
-      # 4. 配置Git（核心修复：适配私有仓库+网络加速）
-      - name: Configure Git for private repos/network
+      # 4. 配置Git（适配私有仓库+网络加速）
+      - name: Configure Git
         run: |
-          # 配置GitHub令牌（若仓库私有，需先在Settings->Secrets添加GITHUB_PAT）
+          # 私有仓库PAT配置（如有）
           if [ -n "${{ secrets.GITHUB_PAT }}" ]; then
             git config --global url."https://${{ secrets.GITHUB_PAT }}:@github.com/".insteadOf "https://github.com/"
-            echo "✅ Configured Git with PAT for private repos"
           fi
-          
-          # 配置超时+缓存+网络加速
+          # 网络加速+超时配置
           git config --global http.timeout 300
-          git config --global credential.helper 'cache --timeout=300'
-          # 国内网络优化（可选）
-          git config --global url."https://ghproxy.com/https://github.com/".insteadOf "https://github.com/"
+          git config --global url."https://mirror.ghproxy.com/https://github.com/".insteadOf "https://github.com/"
 
       # 5. 原生安装Android SDK
       - name: Install Android SDK
@@ -78,13 +83,13 @@ jobs:
           yes | sdkmanager --licenses > /dev/null
           sdkmanager "platforms;android-33" "build-tools;33.0.2" "platform-tools"
 
-      # 6. 克隆项目（增加重试+详细错误输出）
+      # 6. 克隆项目（多轮重试）
       - name: Clone project (with retry)
         run: |
           rm -rf project
           CLONE_SUCCESS=0
           
-          # 尝试1：修复后的带.git地址（3次重试）
+          # 3次重试克隆
           for i in {1..3}; do
             echo "🔹 Attempt $i: Clone ${{ env.PROJECT_URL }}"
             if git clone --depth=1 --timeout=300 ${{ env.PROJECT_URL }} project; then
@@ -95,32 +100,13 @@ jobs:
             sleep 5
           done
           
-          # 尝试2：原始地址（3次重试）
           if [ $CLONE_SUCCESS -eq 0 ]; then
-            for i in {1..3}; do
-              echo "🔹 Attempt $i: Clone ${{ env.RAW_URL }}"
-              if git clone --depth=1 --timeout=300 ${{ env.RAW_URL }} project; then
-                CLONE_SUCCESS=1
-                break
-              fi
-              echo "⚠️ Attempt $i failed, waiting 5s..."
-              sleep 5
-            done
-          fi
-          
-          # 最终校验
-          if [ $CLONE_SUCCESS -eq 0 ]; then
-            echo "❌ Failed to clone project with both URLs!"
-            echo "📝 Debug info:"
-            echo "   Fixed URL: ${{ env.PROJECT_URL }}"
-            echo "   Raw URL: ${{ env.RAW_URL }}"
-            echo "   Git version: $(git --version)"
+            echo "❌ Failed to clone project!"
             exit 1
           fi
           
           chmod -R 755 project
-          echo "✅ Clone succeeded! Project files:"
-          ls -la project/
+          echo "✅ Clone succeeded!"
 
       # 7. 配置Gradle镜像
       - name: Gradle mirror
